@@ -6,6 +6,8 @@ use itertools::Itertools;
 
 use crate::Task;
 
+pub type FanoutError<T> = Either<async_channel::SendError<T>, async_channel::RecvError>;
+
 pub struct FanOut<T, const N: usize> {
     fan_tx: [Sender<T>; N],
     rx: Receiver<T>,
@@ -15,12 +17,7 @@ impl<T, const N: usize> FanOut<T, N>
 where
     T: Clone + Send,
 {
-    pub fn new(
-        rx: Receiver<T>,
-    ) -> (
-        [Receiver<T>; N],
-        impl Task<Error = Either<async_channel::SendError<T>, async_channel::RecvError>>,
-    ) {
+    pub fn new(rx: Receiver<T>) -> ([Receiver<T>; N], impl Task<Error = FanoutError<T>>) {
         // the main channel
         let fan_out: [(Sender<T>, Receiver<T>); N] = array::from_fn(|_| bounded(1));
         let fan_tx = fan_out
@@ -44,7 +41,7 @@ impl<T, const N: usize> Task for FanOut<T, N>
 where
     T: Clone + Send,
 {
-    type Error = Either<async_channel::SendError<T>, async_channel::RecvError>;
+    type Error = FanoutError<T>;
 
     async fn run(self) -> Result<(), Self::Error> {
         loop {
@@ -66,26 +63,36 @@ mod tests {
 
     #[tokio::test]
     async fn fanout() {
-        let (tx, rx) = async_channel::bounded(1);
+        let (tx_1, rx) = async_channel::bounded(1);
         let ([rx_1, rx_2], fanout) = FanOut::new(rx);
+
+        let tx_2 = tx_1.clone();
 
         let max = Duration::from_millis(100);
         let mut completed: bool = false;
         let txrx = timeout(max, async {
-            let send = tx.send(1).await;
+            let send_1 = tx_1.send(1).await;
             let recv_1 = rx_1.recv().await;
             let recv_2 = rx_2.recv().await;
 
-            assert_eq!(send, Ok(()));
+            assert_eq!(send_1, Ok(()));
             assert_eq!(recv_1, Ok(1));
             assert_eq!(recv_2, Ok(1));
 
+            let send_2 = tx_2.send(2).await;
+            let recv_1 = rx_1.recv().await;
+            let recv_2 = rx_2.recv().await;
+
+            assert_eq!(send_2, Ok(()));
+            assert_eq!(recv_1, Ok(2));
+            assert_eq!(recv_2, Ok(2));
+
             completed = true;
-            tx.close(); // drop the sender to complete the driver
+            tx_1.close(); // drop the sender to complete the driver
         });
 
         let (txrx, _) = join!(txrx, fanout.run());
-        
+
         assert!(
             txrx.is_ok(),
             "txrx should not timeout; if so the fanout driver did not run."
